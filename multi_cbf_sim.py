@@ -138,6 +138,7 @@ def simulate_swarm(initial_states, targets, t_end=6.0, dt=0.02):
 # 5. Animation
 
 # (Head-on Collision Test)
+'''
 def run_and_animate():
     # Scenario: Drone 0 is at x=-2, wants to go to x=2
     #           Drone 1 is at x=2, wants to go to x=-2
@@ -190,6 +191,57 @@ def run_and_animate():
 
     anim = FuncAnimation(fig, update, frames=len(t), interval=20, blit=True)
     plt.show()
+'''
+# (Symmetry Breaking Test)
+def run_and_animate():
+    # Drone 2 starts slightly higher (y=1.05)
+    initial_states = np.array([
+        [-2.5, 1.00, 0.0, 0.0, 0.0, 0.0],
+        [ 2.5, 1.05, 0.0, 0.0, 0.0, 0.0]
+    ])
+    
+    targets = np.array([
+        [ 2.5, 1.00],
+        [-2.5, 1.05]
+    ])
+    
+    t, history = simulate_swarm(initial_states, targets, t_end=5.0, dt=0.02)
+    
+    # --- Basic Plotting ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_xlim(-3, 3)
+    ax.set_ylim(0, 2)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_title("Multi-Agent CBF: Deadlock Resolved via Symmetry Breaking")
+    
+    # Plot target points
+    ax.plot(2.5, 1.00, 'b*', markersize=12, label="Target 1")
+    ax.plot(-2.5, 1.05, 'r*', markersize=12, label="Target 2")
+    
+    drone1_dot, = ax.plot([], [], 'bo', markersize=10, label="Drone 1")
+    drone2_dot, = ax.plot([], [], 'ro', markersize=10, label="Drone 2")
+    
+    # Draw personal bubbles (Radius = D_s / 2 = 0.3)
+    bubble1 = plt.Circle((0, 0), 0.3, color='b', fill=False, linestyle='--')
+    bubble2 = plt.Circle((0, 0), 0.3, color='r', fill=False, linestyle='--')
+    ax.add_patch(bubble1)
+    ax.add_patch(bubble2)
+    
+    ax.legend(loc='upper right')
 
+    def update(frame):
+        x1, y1 = history[frame, 0, 0:2]
+        x2, y2 = history[frame, 1, 0:2]
+        
+        drone1_dot.set_data([x1], [y1])
+        drone2_dot.set_data([x2], [y2])
+        bubble1.center = (x1, y1)
+        bubble2.center = (x2, y2)
+        
+        return drone1_dot, drone2_dot, bubble1, bubble2
+
+    anim = FuncAnimation(fig, update, frames=len(t), interval=20, blit=True)
+    plt.show()
 if __name__ == "__main__":
     run_and_animate()
