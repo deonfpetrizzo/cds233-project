@@ -5,6 +5,7 @@ import matplotlib.patches as mpatches
 import matplotlib.transforms as mtransforms
 from matplotlib.animation import FuncAnimation
 from dataclasses import dataclass
+from sim import QuadrotorInstance
 
 @dataclass
 class QuadrotorParams:
@@ -138,7 +139,7 @@ def simulate_swarm(initial_states, targets, t_end=6.0, dt=0.02):
 # 5. Animation
 
 # (Head-on Collision Test)
-'''
+
 def run_and_animate():
     # Scenario: Drone 0 is at x=-2, wants to go to x=2
     #           Drone 1 is at x=2, wants to go to x=-2
@@ -193,6 +194,7 @@ def run_and_animate():
     plt.show()
 '''
 # (Symmetry Breaking Test)
+
 def run_and_animate():
     # Drone 2 starts slightly higher (y=1.05)
     initial_states = np.array([
@@ -243,5 +245,6 @@ def run_and_animate():
 
     anim = FuncAnimation(fig, update, frames=len(t), interval=20, blit=True)
     plt.show()
+'''
 if __name__ == "__main__":
     run_and_animate()
