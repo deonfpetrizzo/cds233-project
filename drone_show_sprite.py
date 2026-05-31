@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 
+
+
 @dataclass
 class QuadrotorParams:
     m: float = 1.0    
@@ -31,6 +33,8 @@ def g_matrix(x: np.ndarray, params: QuadrotorParams) -> np.ndarray:
     G[4, :] = [ c / m,  c / m]
     G[5, :] = [ r / I, -r / I]
     return G
+
+
 
 
 def _build_lqr(q_pos=9.0, q_vel=6.0, r_ctrl=1.0):
@@ -76,7 +80,6 @@ def map_accel_to_thrusts(state, accel_safe, params):
 
 _KD_BRAKE = 2.5 
 
-
 def solve_cbf_qp(states, u_nom, D_s=0.6, alpha1=3.0, gamma=3.0):
     N = states.shape[0]
     u = cp.Variable(2 * N)
@@ -110,6 +113,8 @@ def solve_cbf_qp(states, u_nom, D_s=0.6, alpha1=3.0, gamma=3.0):
             return -_KD_BRAKE * states[:, 3:5]
     except Exception:
         return -_KD_BRAKE * states[:, 3:5]
+
+
 
 
 @dataclass
@@ -234,6 +239,8 @@ class MultiQuadrotorSim:
         return anim
 
 
+
+
 def create_example_sprite(path="example_sprite.png"):
     """Write a small multi-color pixel-art heart (transparent background) to demo
     the pipeline. Replace `path` with any pixel sprite (PNG/GIF) of your own."""
@@ -308,8 +315,10 @@ def make_start_positions(N, width, spacing=1.0, top_y=-0.5, seed=42):
     return slots[:N]
 
 
-def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0,
-                            base_y=5.0, t_end=16.0, max_drones=45):
+
+
+
+def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, base_y=5.0, t_end=16.0, max_drones=45):
     # No sprite supplied -> generate the demo heart so this runs out of the box.
     if sprite_path is None:
         sprite_path = create_example_sprite()
