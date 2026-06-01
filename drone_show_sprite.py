@@ -80,29 +80,7 @@ def map_accel_to_thrusts(state, accel_safe, params):
 
 _KD_BRAKE = 2.5 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#   CBF-QP collision-avoidance safety filter
-# ─────────────────────────────────────────────────────────────────────────────
-#  solve_cbf_qp (below) rebuilds the cvxpy problem from scratch every call. For a
-#  long simulation that is wasteful: cvxpy re-CANONICALIZES the whole problem
-#  (Python-side, single-threaded) at every timestep, which dominates runtime --
-#  the actual numerical solve of these small QPs is negligible by comparison.
-#
-#  WarmStartCBF instead builds the problem ONCE using cp.Parameter placeholders for
-#  every state-dependent coefficient, so canonicalization happens a single time. Each
-#  step it just updates parameter VALUES and re-solves with OSQP warm-started from the
-#  previous solution (consecutive steps have nearly identical solutions). This is the
-#  standard real-time-MPC pattern.
-#
-#  A parameterized problem needs a FIXED structure, but the radius gate changes which
-#  pairs are active step to step. We keep ALL N(N-1)/2 pairs in the problem and make
-#  out-of-range pairs inert (zero coefficient row, rhs = -1, so "0 >= -1" holds and the
-#  constraint never binds). All coefficients are computed in one vectorized numpy pass.
-#
-#  Measured on the 27-drone heart: identical trajectories (min_sep, max_err match the
-#  per-step rebuild bit-for-bit), CBF time 49.2s -> 2.4s. Per-step speedup is ~17-27x
-#  across N=27..100. The one-time build cost (canonicalizing all pairs once) grows with
-#  N but is amortized over the whole run.
+
 class WarmStartCBF:
     """Warm-started, parameterized centralized CBF-QP. Build once per agent count;
     call each timestep with the current states and nominal accelerations."""
@@ -118,13 +96,11 @@ class WarmStartCBF:
         self.J = pairs[:, 1]
         self.npr = len(pairs)
 
-        # Decision variable and parameters (filled with values each step)
         self.u    = cp.Variable((N, 2))
-        self.un_p = cp.Parameter((N, 2))            # nominal accelerations
-        self.dp_p = cp.Parameter((self.npr, 2))     # holds 2*dp per pair (0 if inert)
-        self.rhs_p = cp.Parameter(self.npr)         # HOCBF RHS per pair (-1 if inert)
+        self.un_p = cp.Parameter((N, 2))           
+        self.dp_p = cp.Parameter((self.npr, 2))    
+        self.rhs_p = cp.Parameter(self.npr)        
 
-        # One constraint per pair: 2 dp . (u_i - u_j) >= RHS  (DPP-valid: param @ var)
         cons = [self.dp_p[p] @ self.u[self.I[p]] - self.dp_p[p] @ self.u[self.J[p]]
                 >= self.rhs_p[p] for p in range(self.npr)]
         self.prob = cp.Problem(cp.Minimize(cp.sum_squares(self.u - self.un_p)), cons)
@@ -134,15 +110,13 @@ class WarmStartCBF:
         Pp = states[:, 0:2]
         Vv = states[:, 3:5]
 
-        # Vectorized pairwise coefficients (no Python loop)
-        dp = Pp[self.I] - Pp[self.J]                 # (npr, 2)
+        dp = Pp[self.I] - Pp[self.J]                 
         dv = Vv[self.I] - Vv[self.J]
         dist2 = np.sum(dp * dp, axis=1)
         rhs = (-2.0 * np.sum(dv * dv, axis=1)
                - (self.gamma + self.alpha1) * (2.0 * np.sum(dp * dv, axis=1))
                - self.alpha1 * self.gamma * (dist2 - self.D_s**2))
 
-        # Radius gate: out-of-range pairs become inert (zero coeff, rhs = -1)
         active = dist2 <= self.D_sense**2
         self.dp_p.value  = np.where(active[:, None], 2.0 * dp, 0.0)
         self.rhs_p.value = np.where(active, rhs, -1.0)
@@ -158,8 +132,6 @@ class WarmStartCBF:
 
 
 def solve_cbf_qp(states, u_nom, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0, flag=True):
-    """Stateless per-step rebuild (kept for reference / one-off calls). The simulation
-    loop uses WarmStartCBF instead for a ~20x speedup; this gives identical results."""
     N = states.shape[0]
     u = cp.Variable(2 * N)
     u_nom_flat = u_nom.flatten()
@@ -273,13 +245,13 @@ class MultiQuadrotorSim:
         ax.set_ylabel('$y$ [m]')
         ax.set_title(f'Drone Show: {len(self.instances)}-Agent Sprite Assembly')
         
-        ax.set_facecolor('#111111')
-        fig.patch.set_facecolor('#111111')
-        ax.xaxis.label.set_color('white')
-        ax.yaxis.label.set_color('white')
-        ax.title.set_color('white')
-        ax.tick_params(colors='white')
-        ax.grid(True, alpha=0.1)
+        ax.set_facecolor('#ffffff')
+        fig.patch.set_facecolor('#ffffff')
+        ax.xaxis.label.set_color('black')
+        ax.yaxis.label.set_color('black')
+        ax.title.set_color('black')
+        ax.tick_params(colors='black')
+        ax.grid(True, alpha=0.15)
         
         all_x = np.concatenate([inst.X[:, 0] for inst in self.instances])
         all_y = np.concatenate([inst.X[:, 1] for inst in self.instances])
@@ -287,7 +259,7 @@ class MultiQuadrotorSim:
         ax.set_xlim(all_x.min() - pad, all_x.max() + pad)
         ax.set_ylim(all_y.min() - pad, all_y.max() + pad)
 
-        time_text = ax.text(0.02, 0.96, '', transform=ax.transAxes, fontsize=12, va='top', color='white')
+        time_text = ax.text(0.02, 0.96, '', transform=ax.transAxes, fontsize=12, va='top', color='black')
 
         vehicle_artists = []
         # Original small drone dimensions, but body is now a SOLID fill of the agent's
@@ -410,7 +382,7 @@ def make_start_positions(N, width, spacing=1.0, top_y=-0.5, seed=42):
 
 
 def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, base_y=5.0,
-                            t_end=16.0, max_drones=45, warm_start=True):
+                            t_end=60.0, max_drones=45, warm_start=True):
     # No sprite supplied -> generate the demo heart so this runs out of the box.
     if sprite_path is None:
         sprite_path = create_example_sprite()
@@ -436,9 +408,9 @@ def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, ba
         instances.append(QuadrotorInstance(x0=x0, target=targets[i], color=colors[i]))
 
     sim = MultiQuadrotorSim(instances)
-    sim.run_centralized(t_span=(0.0, t_end), dt=0.04, warm_start=warm_start)
+    sim.run_centralized(t_span=(0.0, t_end), dt=0.04, warm_start=warm_start, a_max=1.5)
     anim = sim.animate(arm_scale=1.0, trail_len=15)
     plt.show()
 
 if __name__ == "__main__":
-    run_drone_show_scenario(sprite_path="heart.png", max_drones=300)
+    run_drone_show_scenario(sprite_path="figs/flamingo.png", max_drones=300)
