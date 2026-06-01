@@ -9,7 +9,7 @@ from scipy.linalg import solve_continuous_are
 from PIL import Image
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-
+import time
 
 
 
@@ -80,7 +80,56 @@ def map_accel_to_thrusts(state, accel_safe, params):
 
 _KD_BRAKE = 2.5 
 
-def solve_cbf_qp(states, u_nom, D_s=0.6, alpha1=3.0, gamma=3.0):
+
+class WarmStartCBF:
+    def __init__(self, N, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0):
+        self.N = N
+        self.D_s = D_s
+        self.D_sense = D_sense
+        self.alpha1 = alpha1
+        self.gamma = gamma
+
+        pairs = np.array([(i, j) for i in range(N) for j in range(i + 1, N)], dtype=int)
+        self.I = pairs[:, 0]
+        self.J = pairs[:, 1]
+        self.npr = len(pairs)
+
+        self.u    = cp.Variable((N, 2))
+        self.un_p = cp.Parameter((N, 2))           
+        self.dp_p = cp.Parameter((self.npr, 2)) 
+        self.rhs_p = cp.Parameter(self.npr)        
+
+        cons = [self.dp_p[p] @ self.u[self.I[p]] - self.dp_p[p] @ self.u[self.J[p]]
+                >= self.rhs_p[p] for p in range(self.npr)]
+        self.prob = cp.Problem(cp.Minimize(cp.sum_squares(self.u - self.un_p)), cons)
+
+    def __call__(self, states, u_nom):
+        N = self.N
+        Pp = states[:, 0:2]
+        Vv = states[:, 3:5]
+
+        dp = Pp[self.I] - Pp[self.J]               
+        dv = Vv[self.I] - Vv[self.J]
+        dist2 = np.sum(dp * dp, axis=1)
+        rhs = (-2.0 * np.sum(dv * dv, axis=1)
+               - (self.gamma + self.alpha1) * (2.0 * np.sum(dp * dv, axis=1))
+               - self.alpha1 * self.gamma * (dist2 - self.D_s**2))
+
+        active = dist2 <= self.D_sense**2
+        self.dp_p.value  = np.where(active[:, None], 2.0 * dp, 0.0)
+        self.rhs_p.value = np.where(active, rhs, -1.0)
+        self.un_p.value  = u_nom
+
+        try:
+            self.prob.solve(solver=cp.OSQP, warm_start=True)
+            if self.prob.status in ['optimal', 'optimal_inaccurate'] and self.u.value is not None:
+                return self.u.value.copy()
+            return -_KD_BRAKE * states[:, 3:5]
+        except Exception:
+            return -_KD_BRAKE * states[:, 3:5]
+
+
+def solve_cbf_qp(states, u_nom, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0, flag=True):
     N = states.shape[0]
     u = cp.Variable(2 * N)
     u_nom_flat = u_nom.flatten()
@@ -94,6 +143,10 @@ def solve_cbf_qp(states, u_nom, D_s=0.6, alpha1=3.0, gamma=3.0):
 
             dp = p_i - p_j
             dv = v_i - v_j
+
+            dist = np.linalg.norm(dp)
+            if flag and dist > D_sense:
+                continue
 
             A_i = 2 * dp
             A_j = -2 * dp
@@ -130,7 +183,8 @@ class MultiQuadrotorSim:
     def __init__(self, instances: List[QuadrotorInstance]):
         self.instances = instances
 
-    def run_centralized(self, t_span=(0.0, 16.0), dt=0.04, a_max=None):
+    def run_centralized(self, t_span=(0.0, 16.0), dt=0.04, a_max=None,
+                        D_s=0.6, D_sense=2.0, warm_start=True):
         N = len(self.instances)
         time_grid = np.arange(t_span[0], t_span[1] + dt, dt)
         
@@ -142,7 +196,15 @@ class MultiQuadrotorSim:
         print(f"--- Starting Drone Show ---")
         print(f"Agents: {N} | Active Collision Constraints: {int(N*(N-1)/2)}")
         print(f"LQR nominal: K={np.round(_K,3)} (kp={_K[0]:.2f}, kd={_K[1]:.2f})")
-        
+        print(f"CBF filter: {'warm-started (build once)' if warm_start else 'rebuild each step'}")
+
+        cbf = None
+        if warm_start:
+            t_build = time.time()
+            cbf = WarmStartCBF(N, D_s=D_s, D_sense=D_sense)
+            print(f"  one-time QP build: {time.time()-t_build:.1f}s")
+
+        start = time.time()
         for k in range(1, len(time_grid)):
             t_start = time_grid[k-1]
             t_end = time_grid[k]
@@ -156,7 +218,10 @@ class MultiQuadrotorSim:
             for i, inst in enumerate(self.instances):
                 u_nom[i] = lqr_control(current_states[i], inst.target, a_max=a_max)
                 
-            u_safe = solve_cbf_qp(current_states, u_nom, D_s=0.6)
+            if warm_start:
+                u_safe = cbf(current_states, u_nom)
+            else:
+                u_safe = solve_cbf_qp(current_states, u_nom, D_s=D_s, D_sense=D_sense)
             
             for i, inst in enumerate(self.instances):
                 def dyn(t, x, accel=u_safe[i], p=inst.params):
@@ -165,7 +230,8 @@ class MultiQuadrotorSim:
 
                 sol = solve_ivp(dyn, [t_start, t_end], current_states[i], method="RK45")
                 inst.X[k] = sol.y[:, -1]
-                
+        end = time.time()
+        print("Computation time: ", end-start) 
         print("Simulation Complete!")
         return self
 
@@ -318,7 +384,8 @@ def make_start_positions(N, width, spacing=1.0, top_y=-0.5, seed=42):
 
 
 
-def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, base_y=5.0, t_end=16.0, max_drones=45):
+def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, base_y=5.0,
+                            t_end=60.0, max_drones=45, warm_start=True):
     # No sprite supplied -> generate the demo heart so this runs out of the box.
     if sprite_path is None:
         sprite_path = create_example_sprite()
@@ -344,9 +411,9 @@ def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, ba
         instances.append(QuadrotorInstance(x0=x0, target=targets[i], color=colors[i]))
 
     sim = MultiQuadrotorSim(instances)
-    sim.run_centralized(t_span=(0.0, t_end), dt=0.04)
+    sim.run_centralized(t_span=(0.0, t_end), dt=0.04, warm_start=warm_start)
     anim = sim.animate(arm_scale=1.0, trail_len=15)
     plt.show()
 
 if __name__ == "__main__":
-    run_drone_show_scenario(sprite_path="heart.png")
+    run_drone_show_scenario(sprite_path="ames.jpeg", max_drones=300)
