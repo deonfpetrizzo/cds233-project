@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import time
 
+from matplotlib.animation import FFMpegWriter
 
 
 @dataclass
@@ -84,12 +85,13 @@ _KD_BRAKE = 2.5
 class WarmStartCBF:
     """Warm-started, parameterized centralized CBF-QP. Build once per agent count;
     call each timestep with the current states and nominal accelerations."""
-    def __init__(self, N, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0):
+    def __init__(self, N, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0, epsilon=None):
         self.N = N
         self.D_s = D_s
         self.D_sense = D_sense
         self.alpha1 = alpha1
         self.gamma = gamma
+        self.epsilon = epsilon
 
         pairs = np.array([(i, j) for i in range(N) for j in range(i + 1, N)], dtype=int)
         self.I = pairs[:, 0]
@@ -98,7 +100,7 @@ class WarmStartCBF:
 
         self.u    = cp.Variable((N, 2))
         self.un_p = cp.Parameter((N, 2))           
-        self.dp_p = cp.Parameter((self.npr, 2))    
+        self.dp_p = cp.Parameter((self.npr, 2))     
         self.rhs_p = cp.Parameter(self.npr)        
 
         cons = [self.dp_p[p] @ self.u[self.I[p]] - self.dp_p[p] @ self.u[self.J[p]]
@@ -117,6 +119,11 @@ class WarmStartCBF:
                - (self.gamma + self.alpha1) * (2.0 * np.sum(dp * dv, axis=1))
                - self.alpha1 * self.gamma * (dist2 - self.D_s**2))
 
+        # ISSf robustness: tighten by (1/epsilon)||Lg h_e||^2 = (8/epsilon)||dp||^2
+        if self.epsilon is not None:
+            rhs = rhs + (8.0 / self.epsilon) * dist2
+
+        # Radius gate: out-of-range pairs become inert (zero coeff, rhs = -1)
         active = dist2 <= self.D_sense**2
         self.dp_p.value  = np.where(active[:, None], 2.0 * dp, 0.0)
         self.rhs_p.value = np.where(active, rhs, -1.0)
@@ -131,7 +138,7 @@ class WarmStartCBF:
             return -_KD_BRAKE * states[:, 3:5]
 
 
-def solve_cbf_qp(states, u_nom, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0, flag=True):
+def solve_cbf_qp(states, u_nom, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0, flag=True, epsilon=None):
     N = states.shape[0]
     u = cp.Variable(2 * N)
     u_nom_flat = u_nom.flatten()
@@ -156,6 +163,10 @@ def solve_cbf_qp(states, u_nom, D_s=0.6, D_sense=2.0, alpha1=3.0, gamma=3.0, fla
             RHS = -2 * np.linalg.norm(dv)**2 \
                   - (gamma + alpha1) * (2 * np.dot(dp, dv)) \
                   - alpha1 * gamma * (np.linalg.norm(dp)**2 - D_s**2)
+
+            # ISSf robustness: tighten by (1/epsilon)||Lg h_e||^2 = (8/epsilon)||dp||^2
+            if epsilon is not None:
+                RHS += (8.0 / epsilon) * dist**2
 
             constraints.append(A_i @ u[2*i : 2*i+2] + A_j @ u[2*j : 2*j+2] >= RHS)
 
@@ -186,15 +197,25 @@ class MultiQuadrotorSim:
         self.instances = instances
 
     def run_centralized(self, t_span=(0.0, 16.0), dt=0.04, a_max=None,
-                        D_s=0.6, D_sense=2.0, warm_start=True):
+                        D_s=0.6, D_sense=2.0, warm_start=True, epsilon=None,
+                        converge_pos_tol=0.05, converge_vel_tol=0.05, converge_hold=5):
+        """Runs until either t_span[1] OR all agents converge to their targets.
+        Convergence: every agent within `converge_pos_tol` (m) of its target with
+        speed below `converge_vel_tol` (m/s), sustained for `converge_hold` steps
+        (so a transient fly-through does not trigger it). Set converge_pos_tol=None
+        to disable early termination and run the full horizon. Histories are trimmed
+        to the actual stop time, so animate() sees only real frames."""
         N = len(self.instances)
         time_grid = np.arange(t_span[0], t_span[1] + dt, dt)
-        
+        n_steps = len(time_grid)
+
         for inst in self.instances:
             inst.t = time_grid
-            inst.X = np.zeros((len(time_grid), 6))
+            inst.X = np.zeros((n_steps, 6))
             inst.X[0] = inst.x0
-            
+
+        targets = np.array([inst.target for inst in self.instances])
+
         print(f"--- Starting Drone Show ---")
         print(f"Agents: {N} | Active Collision Constraints: {int(N*(N-1)/2)}")
         print(f"LQR nominal: K={np.round(_K,3)} (kp={_K[0]:.2f}, kd={_K[1]:.2f})")
@@ -204,28 +225,30 @@ class MultiQuadrotorSim:
         cbf = None
         if warm_start:
             t_build = time.time()
-            cbf = WarmStartCBF(N, D_s=D_s, D_sense=D_sense)
+            cbf = WarmStartCBF(N, D_s=D_s, D_sense=D_sense, epsilon=epsilon)
             print(f"  one-time QP build: {time.time()-t_build:.1f}s")
 
         start = time.time()
-        for k in range(1, len(time_grid)):
+        last_k = n_steps - 1          # index of the final stored frame
+        hold = 0                      # consecutive converged steps
+        for k in range(1, n_steps):
             t_start = time_grid[k-1]
             t_end = time_grid[k]
-            
+
             if k % 25 == 0:
                 print(f"Simulating time {t_end:.2f}s / {t_span[1]:.2f}s ...")
-            
+
             current_states = np.array([inst.X[k-1] for inst in self.instances])
-            
+
             u_nom = np.zeros((N, 2))
             for i, inst in enumerate(self.instances):
                 u_nom[i] = lqr_control(current_states[i], inst.target, a_max=a_max)
-                
+
             if warm_start:
                 u_safe = cbf(current_states, u_nom)
             else:
-                u_safe = solve_cbf_qp(current_states, u_nom, D_s=D_s, D_sense=D_sense)
-            
+                u_safe = solve_cbf_qp(current_states, u_nom, D_s=D_s, D_sense=D_sense, epsilon=epsilon)
+
             for i, inst in enumerate(self.instances):
                 def dyn(t, x, accel=u_safe[i], p=inst.params):
                     u_th = map_accel_to_thrusts(x, accel, p)
@@ -233,17 +256,47 @@ class MultiQuadrotorSim:
 
                 sol = solve_ivp(dyn, [t_start, t_end], current_states[i], method="RK45")
                 inst.X[k] = sol.y[:, -1]
+
+            # Convergence check: all agents at target and nearly stopped
+            if converge_pos_tol is not None:
+                nxt = np.array([inst.X[k] for inst in self.instances])
+                pos_err = np.linalg.norm(nxt[:, 0:2] - targets, axis=1)
+                spd     = np.linalg.norm(nxt[:, 3:5], axis=1)
+                if np.all(pos_err <= converge_pos_tol) and np.all(spd <= converge_vel_tol):
+                    hold += 1
+                    if hold >= converge_hold:
+                        last_k = k
+                        print(f"Converged at t = {t_end:.2f}s "
+                              f"(max pos err {pos_err.max():.3f} m, max speed {spd.max():.3f} m/s)")
+                        break
+                else:
+                    hold = 0
+        else:
+            last_k = n_steps - 1
+
+        # Trim histories to the actual stop time so animate() sees only real frames
+        if last_k < n_steps - 1:
+            for inst in self.instances:
+                inst.X = inst.X[:last_k + 1]
+                inst.t = time_grid[:last_k + 1]
+
         end = time.time()
-        print("Computation time: ", end-start) 
-        print("Simulation Complete!")
+        print("Computation time: ", end-start)
+        print(f"Simulation Complete! ({last_k+1} frames, t_end = {self.instances[0].t[-1]:.2f}s)")
         return self
 
-    def animate(self, figsize=(10, 10), interval=40, trail_len=25, arm_scale=1.0):
+    def animate(self, figsize=(10, 10), interval=40, trail_len=25, arm_scale=1.0,
+                box_opacity=1.0, reveal_at_end=True, save_img=True):
+        """box_opacity   : alpha of the faded target squares (0..1).
+        reveal_at_end : if True, the background target squares stay hidden during
+                        transit and appear only on the final frame, once the drones
+                        have converged to their locations. The drones themselves are
+                        visible throughout. Set False to show the squares the whole time."""
         fig, ax = plt.subplots(figsize=figsize)
         ax.set_aspect('equal')
         ax.set_xlabel('$x$ [m]')
         ax.set_ylabel('$y$ [m]')
-        ax.set_title(f'Drone Show: {len(self.instances)}-Agent Sprite Assembly')
+        ax.set_title(f'Drone Show: {len(self.instances)}-Agent Image Assembly')
         
         ax.set_facecolor('#ffffff')
         fig.patch.set_facecolor('#ffffff')
@@ -261,15 +314,20 @@ class MultiQuadrotorSim:
 
         time_text = ax.text(0.02, 0.96, '', transform=ax.transAxes, fontsize=12, va='top', color='black')
 
+        n_frames = len(self.instances[0].t)
+        reveal_frame = n_frames - 30   # target squares appear on one of the last frames
+
         vehicle_artists = []
-        # Original small drone dimensions, but body is now a SOLID fill of the agent's
-        # color (no white outline, no rotors) so the assembled image is legible.
+        # Original small drone dimensions, body is a SOLID fill of the agent's color.
         body_w, body_h = 0.12 * arm_scale, 0.03 * arm_scale
 
         for inst in self.instances:
             c = inst.color
-            # Draw faded target pixel
-            ax.plot(inst.target[0], inst.target[1], 's', color=c, markersize=12, alpha=0.2)
+            # Faded target square (the background marker of where this drone is headed).
+            # Hidden during transit if reveal_at_end; shown only once converged.
+            target_sq, = ax.plot(inst.target[0], inst.target[1], 's', color=c,
+                                 markersize=12, alpha=box_opacity)
+            target_sq.set_visible(not reveal_at_end)
 
             trail, = ax.plot([], [], '-', color=c, lw=1.5, alpha=0.6)
 
@@ -281,23 +339,27 @@ class MultiQuadrotorSim:
                                            boxstyle="round,pad=0.01", linewidth=0, facecolor=c)
             ax.add_patch(body)
 
-            vehicle_artists.append(dict(trail=trail, body=body, bubble=bubble))
+            vehicle_artists.append(dict(trail=trail, body=body, bubble=bubble, target_sq=target_sq))
 
         def _update(frame):
             time_text.set_text(f't = {self.instances[0].t[frame]:.2f} s')
+            show_targets = (not reveal_at_end) or (frame >= reveal_frame)
             for vi, (inst, arts) in enumerate(zip(self.instances, vehicle_artists)):
                 X = inst.X
                 px, py, theta = X[frame, 0], X[frame, 1], X[frame, 2]
-                
+
                 start = max(0, frame - trail_len)
-                arts['trail'].set_data(X[start:frame + 1, 0], X[start:frame + 1, 1])
+                #arts['trail'].set_data(X[start:frame + 1, 0], X[start:frame + 1, 1])
                 arts['bubble'].center = (px, py)
                 arts['body'].set_transform(
                     mtransforms.Affine2D().rotate_around(0, 0, theta).translate(px, py) + ax.transData)
+                arts['target_sq'].set_visible(show_targets)
 
             return [a for arts in vehicle_artists for a in arts.values()] + [time_text]
 
-        anim = FuncAnimation(fig, _update, frames=len(self.instances[0].t), interval=40, blit=False)
+        anim = FuncAnimation(fig, _update, frames=n_frames, interval=40, blit=False)
+        if save_img:
+            anim.save("drone_show.gif", writer="pillow", fps=30)
         plt.tight_layout()
         return anim
 
@@ -382,7 +444,8 @@ def make_start_positions(N, width, spacing=1.0, top_y=-0.5, seed=42):
 
 
 def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, base_y=5.0,
-                            t_end=60.0, max_drones=45, warm_start=True):
+                            t_end=120.0, max_drones=45, warm_start=True,
+                            box_opacity=1.0, reveal_at_end=True):
     # No sprite supplied -> generate the demo heart so this runs out of the box.
     if sprite_path is None:
         sprite_path = create_example_sprite()
@@ -408,9 +471,11 @@ def run_drone_show_scenario(sprite_path=None, target_width=None, spacing=1.0, ba
         instances.append(QuadrotorInstance(x0=x0, target=targets[i], color=colors[i]))
 
     sim = MultiQuadrotorSim(instances)
-    sim.run_centralized(t_span=(0.0, t_end), dt=0.04, warm_start=warm_start, a_max=1.5)
-    anim = sim.animate(arm_scale=1.0, trail_len=15)
+    # t_end now just CAPS the run; the sim stops early once all agents converge.
+    sim.run_centralized(D_sense=5.0, t_span=(0.0, t_end), dt=0.04, warm_start=warm_start, a_max=None, epsilon=None)
+    anim = sim.animate(arm_scale=1.0, trail_len=15,
+                       box_opacity=box_opacity, reveal_at_end=reveal_at_end)
     plt.show()
 
 if __name__ == "__main__":
-    run_drone_show_scenario(sprite_path="figs/flamingo.png", max_drones=300)
+    run_drone_show_scenario(sprite_path="figs/flappy_bird.png", max_drones=300)
